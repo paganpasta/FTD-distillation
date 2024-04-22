@@ -171,6 +171,27 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
     return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv
 
 
+class SameClassDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        try:
+            self.targets = self.dataset.targets
+        except:
+            self.targets = self.dataset.labels
+        try:
+          self.classes = self.dataset.classes
+        except:
+          self.classes = np.unique(self.targets)
+        print('same class dataset', self.classes.shape, self.targets.shape)
+        self.num_classes = len(self.classes)
+        self.class_indices = {cls_idx: np.where(np.array(self.targets) == cls_idx)[0] for cls_idx in range(self.num_classes)}
+
+    def __len__(self):
+        return self.num_classes
+
+    def __getitem__(self, class_idx):
+        imgs = [self.dataset.__getitem__(i)[0] for i in self.class_indices[class_idx]]
+        return torch.stack(imgs)
 
 class TensorDataset(Dataset):
     def __init__(self, images, labels): # images: n x c x h x w tensor
@@ -328,7 +349,7 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
 
         n_b = lab.shape[0]
 
-        output = net(img)
+        output, _ = net(img)
         loss = criterion(output, lab)
 
         acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))

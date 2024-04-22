@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.utils
 from tqdm import tqdm
-from utils.utils_baseline import get_dataset, get_network, get_eval_pool, evaluate_synset, get_time, DiffAugment, ParamDiffAug
+from utils.utils_baseline import SameClassDataset,  get_dataset, get_network, get_eval_pool, evaluate_synset, get_time, DiffAugment, ParamDiffAug
 import wandb
 import copy
 import random
@@ -61,8 +61,9 @@ def main(args):
         zca_trans = None
 
     wandb.init(sync_tensorboard=False,
-               project="DatasetDistillation",
-               job_type="CleanRepo",
+               project="MTT+DM",
+               job_type="Exploration",
+               group="FTD",
                config=args,
                )
 
@@ -138,8 +139,7 @@ def main(args):
     ''' training '''
     image_syn = image_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-
-
+    classwise_real_dataset = SameClassDataset(dst_train)
 
     ###EMA modification
     
@@ -200,7 +200,6 @@ def main(args):
 
     for it in range(0, args.Iteration+1):
         save_this_it = False
-
         # writer.add_scalar('Progress', it, it)
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
@@ -228,7 +227,7 @@ def main(args):
                     image_syn_eval, label_syn_eval = copy.deepcopy(image_save.detach()), copy.deepcopy(eval_labs.detach()) # avoid any unaware modification
 
                     args.lr_net = syn_lr.item()
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture)
+                    noema_net, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture)
                     accs_test.append(acc_test)
                     accs_train.append(acc_train)
 
@@ -239,7 +238,7 @@ def main(args):
                         ema_image_syn = ema.module[0]
                         ema_image_save = ema_image_syn
                     ema_image_syn_eval, ema_label_syn_eval = copy.deepcopy(ema_image_save), copy.deepcopy(ema_eval_labs.detach()) # avoid any unaware modification
-                    _, ema_acc_train, ema_acc_test = evaluate_synset(it_eval, net_eval, ema_image_syn_eval, ema_label_syn_eval, testloader, args, texture=args.texture)
+                    ema_net, ema_acc_train, ema_acc_test = evaluate_synset(it_eval, net_eval, ema_image_syn_eval, ema_label_syn_eval, testloader, args, texture=args.texture)
                     ema_accs_test.append(ema_acc_test)
                     ema_accs_train.append(ema_acc_train)
 
@@ -255,7 +254,6 @@ def main(args):
                     best_std[model_eval] = acc_test_std
                     save_this_it = True
 
-
                 ''' Evaluate ema synthetic data '''
                 ema_accs_test = np.array(ema_accs_test)
                 ema_accs_train = np.array(ema_accs_train)
@@ -265,10 +263,7 @@ def main(args):
                 if ema_acc_test_mean > ema_best_acc[model_eval]:
                     ema_best_acc[model_eval] = ema_acc_test_mean
                     ema_best_std[model_eval] = ema_acc_test_std
-                    save_this_it = True
-
                 
-
                 print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs_test), model_eval, acc_test_mean, acc_test_std))
                 wandb.log({'Accuracy/{}'.format(model_eval): acc_test_mean}, step=it)
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
@@ -301,6 +296,8 @@ def main(args):
                 if save_this_it:
                     torch.save(image_save.cpu(), os.path.join(save_dir, "images_best.pt".format(it)))
                     torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_best.pt".format(it)))
+                    torch.save({'model_state_dict':noema_net.state_dict(), 'ema_state_dict':ema_net.state_dict(), 'epoch':it}, os.path.join(save_dir, "model_best.pt"))
+
 
                 wandb.log({"Pixels": wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
 
@@ -496,7 +493,7 @@ def main(args):
                 forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
             else:
                 forward_params = student_params[-1]
-            x = student_net(x, flat_param=forward_params)
+            x, _ = student_net(x, flat_param=forward_params)
             ce_loss = criterion(x, this_y)
 
             grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
@@ -519,7 +516,28 @@ def main(args):
 
         param_loss /= param_dist
 
-        grand_loss = param_loss
+        student_mean_loss = torch.tensor(0.0).to(args.device)
+        student_std_loss = torch.tensor(0.0).to(args.device)
+
+        if args.student_distmatch:
+            if args.distributed:
+                forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
+            else:
+                forward_params = student_params[-1]
+            for c in range(num_classes):
+                real_images = classwise_real_dataset.__getitem__(c)
+                with torch.no_grad():
+                    _, target_feats = student_net(real_images.to(args.device), flat_param=forward_params)
+                    target_mean, target_std = torch.std_mean(target_feats, dim=0)
+                syn_input = syn_images[c*args.ipc:c*args.ipc+args.ipc]
+                _, syn_feats = student_net(syn_input, flat_param=forward_params)
+                syn_mean, syn_std = torch.std_mean(syn_feats, dim=0)
+                student_mean_loss += torch.nn.functional.mse_loss(syn_mean, target_mean, reduction="mean")
+                student_std_loss += torch.nn.functional.mse_loss(syn_std, target_std, reduction="mean")
+            student_mean_loss /= num_classes
+            student_std_loss /= num_classes
+
+        grand_loss = param_loss + args.student_factor * student_mean_loss + args.student_factor * student_std_loss
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
@@ -534,15 +552,15 @@ def main(args):
         # Update the moving average with the new parameters from the last optimizer step
         ema.update([image_syn])
 
-
-        wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
+        wandb.log({"Grand_Loss": grand_loss.detach().cpu(), "Param_Loss": param_loss.item(), "student_mean": student_mean_loss.item(),
+                   "student_std": student_std_loss.item(),
                    "Start_Epoch": start_epoch})
 
         for _ in student_params:
             del _
 
         if it%10 == 0:
-            print('%s iter = %04d, loss = %.4f' % (get_time(), it, grand_loss.item()))
+            print('%s iter = %04d, loss = %.4f, param_loss=%.4f, stu_mean:%.4f, stu_std:%.4f' % (get_time(), it, grand_loss.item(),param_loss.item(), student_mean_loss.item(), student_std_loss.item()))
 
     wandb.finish()
 
@@ -561,7 +579,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_mode', type=str, default='S',
                         help='eval_mode, check utils.py for more info')
 
-    parser.add_argument('--num_eval', type=int, default=5, help='how many networks to evaluate on')
+    parser.add_argument('--num_eval', type=int, default=2, help='how many networks to evaluate on')
 
     parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
 
@@ -610,6 +628,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
     parser.add_argument('--ema_decay', type=float, default=0.999)
+    
+    parser.add_argument('--student_factor', default=1.0, type=float, help='student dm contribution')
+    parser.add_argument('--student_distmatch', action='store_true', help='Enable dist matching')
+    parser.add_argument('--teacher_distmatch', action='store_true', help='Enable dist matching')
 
     args = parser.parse_args()
 
