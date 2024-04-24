@@ -13,7 +13,6 @@ import wandb
 import copy
 import random
 from reparam_module import ReparamModule
-from model_ema import ModelEmaV2
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -145,7 +144,6 @@ def main(args):
     
     optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-    ema = ModelEmaV2([image_syn], decay=args.ema_decay)
     optimizer_img.zero_grad()
 
     ###
@@ -194,10 +192,6 @@ def main(args):
     best_std = {m: 0 for m in model_eval_pool}
     
 
-    ''' Evaluate ema synthetic data '''
-    ema_best_acc = {m: 0 for m in model_eval_pool}
-    ema_best_std = {m: 0 for m in model_eval_pool}
-
     for it in range(0, args.Iteration+1):
         save_this_it = False
         # writer.add_scalar('Progress', it, it)
@@ -214,9 +208,6 @@ def main(args):
 
                 accs_test = []
                 accs_train = []
-                ''' Evaluate ema synthetic data '''
-                ema_accs_test = []
-                ema_accs_train = []
 
                 for it_eval in range(args.num_eval):
                     net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
@@ -232,18 +223,6 @@ def main(args):
                     accs_train.append(acc_train)
 
 
-                    ''' Evaluate ema synthetic data '''
-                    ema_eval_labs = label_syn
-                    with torch.no_grad():
-                        ema_image_syn = ema.module[0]
-                        ema_image_save = ema_image_syn
-                    ema_image_syn_eval, ema_label_syn_eval = copy.deepcopy(ema_image_save), copy.deepcopy(ema_eval_labs.detach()) # avoid any unaware modification
-                    ema_net, ema_acc_train, ema_acc_test = evaluate_synset(it_eval, net_eval, ema_image_syn_eval, ema_label_syn_eval, testloader, args, texture=args.texture)
-                    ema_accs_test.append(ema_acc_test)
-                    ema_accs_train.append(ema_acc_train)
-
-
-
                 accs_test = np.array(accs_test)
                 accs_train = np.array(accs_train)
                 acc_test_mean = np.mean(accs_test)
@@ -254,30 +233,12 @@ def main(args):
                     best_std[model_eval] = acc_test_std
                     save_this_it = True
 
-                ''' Evaluate ema synthetic data '''
-                ema_accs_test = np.array(ema_accs_test)
-                ema_accs_train = np.array(ema_accs_train)
-                ema_acc_test_mean = np.mean(ema_accs_test)
-                ema_acc_test_std = np.std(ema_accs_test)
-
-                if ema_acc_test_mean > ema_best_acc[model_eval]:
-                    ema_best_acc[model_eval] = ema_acc_test_mean
-                    ema_best_std[model_eval] = ema_acc_test_std
                 
                 print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs_test), model_eval, acc_test_mean, acc_test_std))
                 wandb.log({'Accuracy/{}'.format(model_eval): acc_test_mean}, step=it)
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
-
-
-                ''' Evaluate ema synthetic data '''
-                print('Evaluate ema %d random %s, ema_mean = %.4f ema_std = %.4f\n-------------------------'%(len(ema_accs_test), model_eval, ema_acc_test_mean, ema_acc_test_std))
-                wandb.log({'ema_Accuracy/{}'.format(model_eval): ema_acc_test_mean}, step=it)
-                wandb.log({'ema_Max_Accuracy/{}'.format(model_eval): ema_best_acc[model_eval]}, step=it)
-                wandb.log({'ema_Std/{}'.format(model_eval): ema_acc_test_std}, step=it)
-                wandb.log({'ema_Max_Std/{}'.format(model_eval): ema_best_std[model_eval]}, step=it)
-
 
 
 
@@ -296,7 +257,7 @@ def main(args):
                 if save_this_it:
                     torch.save(image_save.cpu(), os.path.join(save_dir, "images_best.pt".format(it)))
                     torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_best.pt".format(it)))
-                    torch.save({'model_state_dict':noema_net.state_dict(), 'ema_state_dict':ema_net.state_dict(), 'epoch':it}, os.path.join(save_dir, "model_best.pt"))
+                    torch.save({'model_state_dict':noema_net.state_dict(), 'epoch':it}, os.path.join(save_dir, "model_best.pt"))
 
 
                 wandb.log({"Pixels": wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
@@ -345,79 +306,6 @@ def main(args):
                             grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
                             wandb.log({"Clipped_Reconstructed_Images/std_{}".format(clip_val): wandb.Image(
                                 torch.nan_to_num(grid.detach().cpu()))}, step=it)
-
-
-
-
-
-
-        ''' Evaluate ema synthetic data '''
-        if it in eval_it_pool and (save_this_it or it % 1000 == 0):
-            with torch.no_grad():
-                ema_image_save = ema_image_syn.cuda()
-
-                ema_save_dir = os.path.join(".", "ema_logged_files", args.dataset, wandb.run.name)
-
-                if not os.path.exists(ema_save_dir):
-                    os.makedirs(ema_save_dir)
-
-                torch.save(ema_image_save.cpu(), os.path.join(ema_save_dir, "ema_images_{}.pt".format(it)))
-                torch.save(label_syn.cpu(), os.path.join(ema_save_dir, "ema_labels_{}.pt".format(it)))
-
-                if save_this_it:
-                    torch.save(ema_image_save.cpu(), os.path.join(ema_save_dir, "ema_images_best.pt".format(it)))
-                    torch.save(label_syn.cpu(), os.path.join(ema_save_dir, "ema_labels_best.pt".format(it)))
-
-                wandb.log({"ema_Pixels": wandb.Histogram(torch.nan_to_num(ema_image_syn.detach().cpu()))}, step=it)
-
-                if args.ipc < 50 or args.force_save:
-                    upsampled = ema_image_save
-                    if args.dataset != "ImageNet":
-                        upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                        upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                    grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
-                    wandb.log({"ema_Synthetic_Images": wandb.Image(torch.nan_to_num(grid.detach().cpu()))}, step=it)
-                    wandb.log({'ema_Synthetic_Pixels': wandb.Histogram(torch.nan_to_num(ema_image_save.detach().cpu()))}, step=it)
-
-                    for clip_val in [2.5]:
-                        std = torch.std(ema_image_save)
-                        mean = torch.mean(ema_image_save)
-                        upsampled = torch.clip(ema_image_save, min=mean-clip_val*std, max=mean+clip_val*std)
-                        if args.dataset != "ImageNet":
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                        grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
-                        wandb.log({"ema_Clipped_Synthetic_Images/std_{}".format(clip_val): wandb.Image(torch.nan_to_num(grid.detach().cpu()))}, step=it)
-
-                    if args.zca:
-                        ema_image_save = ema_image_save.to(args.device)
-                        ema_image_save = args.zca_trans.inverse_transform(ema_image_save)
-                        ema_image_save.cpu()
-
-                        torch.save(ema_image_save.cpu(), os.path.join(ema_save_dir, "images_zca_{}.pt".format(it)))
-
-                        upsampled = ema_image_save
-                        if args.dataset != "ImageNet":
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                            upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                        grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
-                        wandb.log({"ema_Reconstructed_Images": wandb.Image(torch.nan_to_num(grid.detach().cpu()))}, step=it)
-                        wandb.log({'ema_Reconstructed_Pixels': wandb.Histogram(torch.nan_to_num(ema_image_save.detach().cpu()))}, step=it)
-
-                        for clip_val in [2.5]:
-                            std = torch.std(ema_image_save)
-                            mean = torch.mean(ema_image_save)
-                            upsampled = torch.clip(ema_image_save, min=mean - clip_val * std, max=mean + clip_val * std)
-                            if args.dataset != "ImageNet":
-                                upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
-                                upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=3)
-                            grid = torchvision.utils.make_grid(upsampled, nrow=10, normalize=True, scale_each=True)
-                            wandb.log({"ema_Clipped_Reconstructed_Images/std_{}".format(clip_val): wandb.Image(
-                                torch.nan_to_num(grid.detach().cpu()))}, step=it)
-
-
-
-
 
 
         wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
@@ -554,10 +442,6 @@ def main(args):
         optimizer_lr.step()
 
 
-        ###using EMA
-        # Update the moving average with the new parameters from the last optimizer step
-        ema.update([image_syn])
-
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(), "Param_Loss": param_loss.item(), "student_mean": student_mean_loss.item(),
                    "student_std": student_std_loss.item(),
                    "Start_Epoch": start_epoch})
@@ -633,7 +517,6 @@ if __name__ == '__main__':
     parser.add_argument('--max_experts', type=int, default=None, help='number of experts to read per file (leave as None unless doing ablations)')
 
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
-    parser.add_argument('--ema_decay', type=float, default=0.999)
     
     parser.add_argument('--student_factor', default=1.0, type=float, help='student dm contribution')
     parser.add_argument('--student_distmatch', action='store_true', help='Enable dist matching')
