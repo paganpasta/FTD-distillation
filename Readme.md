@@ -65,10 +65,17 @@ the default data and buffer storage path are ```.\data``` and ```.\buffer_storag
 
 
 ### Distillation by Matching Training Trajectories
-The following command will then use the buffers we just generated to distill CIFAR-100 down to just 10 image per class:
+
+CIFAR-100 IPC50 with **Distribution Matching**
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python distill_FTD.py --dataset=CIFAR100 --ipc=10 --syn_steps=20 --expert_epochs=2 --max_start_epoch=40 --zca \
-    --lr_img=1000 --lr_lr=1e-05 --lr_teacher=0.01 --ema_decay=0.9995 --Iteration=5000 --buffer_path={path_to_buffer_storage} --data_path={path_to_dataset}
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distill_FTD_noema.py --dataset=CIFAR100 --ipc=50 --syn_steps=80 --expert_epochs=2 --batch_syn=1000 --max_start_epoch=40 --zca --lr_img=1000 --lr_lr=1e-05 --lr_teacher=0.01 --buffer_path=../buffer/buffer/ --data_path=/data/ --Iteration=5000 --student_distmatch --student_factor 50 --num_eval 2
+```
+
+CIFAR100 IPC50 baseline
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python distill_FTD_noema.py --dataset=CIFAR100 --ipc=50 --syn_steps=80 --expert_epochs=2 --batch_syn=1000 --max_start_epoch=40 --zca --lr_img=1000 --lr_lr=1e-05 --lr_teacher=0.01 --buffer_path=../buffer/buffer/ --data_path=/data/ --Iteration=5000 --student_factor 0 --num_eval 2
 ```
 
 <img src='docs/results.png' width=800 >
